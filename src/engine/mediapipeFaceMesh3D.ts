@@ -624,6 +624,36 @@ export class MediaPipeFaceMesh3D {
     this.surfaceGeo.computeVertexNormals();
   }
 
+  capturePositions(): Float32Array {
+    return new Float32Array(this.workingPositions);
+  }
+
+  applyPositions(positions: Float32Array): void {
+    const len = Math.min(positions.length, this.workingPositions.length);
+    for (let i = 0; i < len; i++) {
+      this.workingPositions[i] = positions[i];
+    }
+    this.group.rotation.set(0, 0, 0);
+    this.posAttr.needsUpdate = true;
+    this.surfaceGeo.computeVertexNormals();
+  }
+
+  interpolateAndApplyPositions(
+    a: Float32Array,
+    b: Float32Array,
+    alpha: number,
+  ): void {
+    const t = THREE.MathUtils.clamp(alpha, 0, 1);
+    const inv = 1 - t;
+    const len = Math.min(a.length, b.length, this.workingPositions.length);
+    for (let i = 0; i < len; i++) {
+      this.workingPositions[i] = a[i] * inv + b[i] * t;
+    }
+    this.group.rotation.set(0, 0, 0);
+    this.posAttr.needsUpdate = true;
+    this.surfaceGeo.computeVertexNormals();
+  }
+
   dispose(): void {
     this.group.traverse((obj) => {
       if ((obj as THREE.Mesh).geometry) {
@@ -634,4 +664,257 @@ export class MediaPipeFaceMesh3D {
       else if (mat) mat.dispose();
     });
   }
+}
+
+export const FACE_EXPORT_BONES = [
+  'Head',
+  'Jaw',
+  'UpperLip',
+  'MouthCornerL',
+  'MouthCornerR',
+  'UpperLidL',
+  'UpperLidR',
+  'LowerLidL',
+  'LowerLidR',
+  'BrowL',
+  'BrowR',
+] as const;
+
+export type FaceExportBoneName = (typeof FACE_EXPORT_BONES)[number];
+
+export interface FaceExportRig {
+  rootObject: THREE.Group;
+  bones: Record<FaceExportBoneName, THREE.Bone>;
+  restPositions: Record<FaceExportBoneName, THREE.Vector3>;
+  skinnedMesh: THREE.SkinnedMesh;
+  dispose: () => void;
+}
+
+const FACE_PALETTE_COLORS = [
+  0x334155, // 0: Face skin slate surface
+  0x64748b, // 1: Lip subtle highlight
+  0xf59e0b, // 2: Brow / Eye landmark accent
+] as const;
+
+function createFacePaletteTexture(): THREE.DataTexture {
+  const width = 256;
+  const height = 64;
+  const slotWidth = 64;
+  const data = new Uint8Array(width * height * 4);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const slot = Math.min(
+        FACE_PALETTE_COLORS.length - 1,
+        Math.floor(x / slotWidth),
+      );
+      const hex = FACE_PALETTE_COLORS[slot];
+      const idx = (y * width + x) * 4;
+      data[idx] = (hex >> 16) & 255;
+      data[idx + 1] = (hex >> 8) & 255;
+      data[idx + 2] = hex & 255;
+      data[idx + 3] = 255;
+    }
+  }
+
+  const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat);
+  tex.name = 'Beast_Face_Palette';
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearFilter;
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.generateMipmaps = false;
+  tex.flipY = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+export function buildRiggedFaceExportModel(): FaceExportRig {
+  const topology = getFaceTopology();
+  const rootGroup = new THREE.Group();
+  rootGroup.name = 'Beast_Face_Rig_Root';
+
+  const bones = {} as Record<FaceExportBoneName, THREE.Bone>;
+  const boneArray: THREE.Bone[] = [];
+  const restPositions = {} as Record<FaceExportBoneName, THREE.Vector3>;
+
+  const yOffset = 0.12;
+  const offsets: Record<FaceExportBoneName, [number, number, number]> = {
+    Head: [0, yOffset, 0],
+    Jaw: [0, -0.020, 0.015],
+    UpperLip: [0, -0.042, 0.046],
+    MouthCornerL: [0.025, -0.048, 0.042],
+    MouthCornerR: [-0.025, -0.048, 0.042],
+    UpperLidL: [0.0305, 0.022, 0.040],
+    UpperLidR: [-0.0305, 0.022, 0.040],
+    LowerLidL: [0.0305, 0.015, 0.040],
+    LowerLidR: [-0.0305, 0.015, 0.040],
+    BrowL: [0.028, 0.035, 0.043],
+    BrowR: [-0.028, 0.035, 0.043],
+  };
+
+  FACE_EXPORT_BONES.forEach((name) => {
+    const b = new THREE.Bone();
+    b.name = name;
+    const o = offsets[name];
+    b.position.set(o[0], o[1], o[2]);
+    bones[name] = b;
+    restPositions[name] = b.position.clone();
+    boneArray.push(b);
+    if (name === 'Head') {
+      rootGroup.add(b);
+    } else {
+      bones.Head.add(b);
+    }
+  });
+
+  rootGroup.updateMatrixWorld(true);
+
+  // Build indexed triangle BufferGeometry for the 468 face mask surface vertices
+  // (using canonicalPositions shifted by yOffset so chin sits cleanly above Y=0)
+  const vertexCount = 468;
+  const positions = new Float32Array(vertexCount * 3);
+  const uvs = new Float32Array(vertexCount * 2);
+  const skinIndices = new Uint8Array(vertexCount * 4);
+  const skinWeights = new Float32Array(vertexCount * 4);
+
+  const BONE_IDX: Record<FaceExportBoneName, number> = {
+    Head: 0,
+    Jaw: 1,
+    UpperLip: 2,
+    MouthCornerL: 3,
+    MouthCornerR: 4,
+    UpperLidL: 5,
+    UpperLidR: 6,
+    LowerLidL: 7,
+    LowerLidR: 8,
+    BrowL: 9,
+    BrowR: 10,
+  };
+
+  const base = topology.canonicalPositions;
+  for (let i = 0; i < vertexCount; i++) {
+    const x = base[i * 3];
+    const y = base[i * 3 + 1];
+    const z = base[i * 3 + 2];
+    positions[i * 3] = x;
+    positions[i * 3 + 1] = y + yOffset;
+    positions[i * 3 + 2] = z;
+
+    let slot = 0;
+    if (
+      topology.lowerLipFullIndices.has(i) ||
+      topology.upperLipFullIndices.has(i)
+    ) {
+      slot = 1;
+    } else if (
+      topology.upperLidIndices.has(i) ||
+      topology.lowerLidIndices.has(i)
+    ) {
+      slot = 2;
+    }
+    uvs[i * 2] = (slot * 64 + 32) / 256;
+    uvs[i * 2 + 1] = 0.5;
+
+    // Assign smooth facial bone weights (sum strictly = 1.0)
+    let secondaryBone: FaceExportBoneName | null = null;
+    let w = 0;
+
+    if (topology.upperLidIndices.has(i)) {
+      secondaryBone = x >= 0 ? 'UpperLidL' : 'UpperLidR';
+      w = 1.0;
+    } else if (topology.lowerLidIndices.has(i)) {
+      secondaryBone = x >= 0 ? 'LowerLidL' : 'LowerLidR';
+      w = 1.0;
+    } else if (i === 61 || i === 78 || i === 191 || i === 95 || i === 185 || i === 146) {
+      if (x >= 0) {
+        secondaryBone = 'MouthCornerL';
+        w = 0.72;
+      } else {
+        secondaryBone = 'MouthCornerR';
+        w = 0.72;
+      }
+    } else if (i === 291 || i === 308 || i === 415 || i === 324 || i === 409 || i === 375) {
+      if (x >= 0) {
+        secondaryBone = 'MouthCornerL';
+        w = 0.72;
+      } else {
+        secondaryBone = 'MouthCornerR';
+        w = 0.72;
+      }
+    } else if (topology.lowerLipFullIndices.has(i)) {
+      secondaryBone = 'Jaw';
+      w = Math.max(0.25, Math.cos(Math.min(1, Math.abs(x) / 0.032) * Math.PI * 0.5));
+    } else if (topology.upperLipFullIndices.has(i)) {
+      secondaryBone = 'UpperLip';
+      w = Math.max(0.2, 0.75 * Math.cos(Math.min(1, Math.abs(x) / 0.028) * Math.PI * 0.5));
+    } else if (y < -0.048 && Math.abs(x) < 0.068) {
+      secondaryBone = 'Jaw';
+      const lat = 0.5 * (1 + Math.cos(Math.PI * Math.min(1, Math.abs(x) / 0.068)));
+      const vert = Math.exp(-Math.pow(Math.max(0, -0.052 - y) / 0.065, 2));
+      w = 0.85 * lat * vert;
+    } else if (y > 0.027 && y < 0.052 && Math.abs(x) > 0.006 && Math.abs(x) < 0.055) {
+      secondaryBone = x >= 0 ? 'BrowL' : 'BrowR';
+      w = 0.75 * Math.sin(Math.min(1, (Math.abs(x) - 0.006) / 0.049) * Math.PI);
+    }
+
+    if (secondaryBone && w > 0.01) {
+      const clampedW = THREE.MathUtils.clamp(w, 0, 1);
+      skinIndices[i * 4] = BONE_IDX[secondaryBone];
+      skinIndices[i * 4 + 1] = 0; // Head
+      skinWeights[i * 4] = clampedW;
+      skinWeights[i * 4 + 1] = 1 - clampedW;
+    } else {
+      skinIndices[i * 4] = 0;
+      skinWeights[i * 4] = 1.0;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setIndex(new THREE.BufferAttribute(new Uint16Array(topology.triangleIndices), 1));
+  geo.computeVertexNormals();
+  geo.normalizeNormals();
+  const nAttr = geo.attributes.normal as THREE.BufferAttribute;
+  for (let i = 0; i < nAttr.count; i++) {
+    const nx = nAttr.getX(i);
+    const ny = nAttr.getY(i);
+    const nz = nAttr.getZ(i);
+    const len = Math.hypot(nx, ny, nz);
+    if (!Number.isFinite(len) || len < 1e-6) {
+      nAttr.setXYZ(i, 0, 0, 1);
+    } else {
+      nAttr.setXYZ(i, nx / len, ny / len, nz / len);
+    }
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setAttribute('skinIndex', new THREE.BufferAttribute(skinIndices, 4));
+  geo.setAttribute('skinWeight', new THREE.BufferAttribute(skinWeights, 4));
+
+  const paletteTex = createFacePaletteTexture();
+  const mat = new THREE.MeshStandardMaterial({
+    map: paletteTex,
+    roughness: 0.45,
+    metalness: 0.18,
+  });
+
+  const skinnedMesh = new THREE.SkinnedMesh(geo, mat);
+  skinnedMesh.name = 'Beast_MediaPipe_Face';
+  const skeleton = new THREE.Skeleton(boneArray);
+  skinnedMesh.bind(skeleton);
+  rootGroup.add(skinnedMesh);
+  rootGroup.updateMatrixWorld(true);
+
+  return {
+    rootObject: rootGroup,
+    bones,
+    restPositions,
+    skinnedMesh,
+    dispose: () => {
+      geo.dispose();
+      paletteTex.dispose();
+      mat.dispose();
+    },
+  };
 }
