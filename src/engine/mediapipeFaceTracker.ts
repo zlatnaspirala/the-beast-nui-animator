@@ -146,10 +146,10 @@ export function extractFaceRigOutput(
         if (key.startsWith('eyeBlink')) {
           score = THREE.MathUtils.clamp((score - 0.12) / 0.55, 0, 1);
         } else if (key === 'jawOpen') {
-          // Deadzone against rest jitter (> 0.14) while allowing full intentional mouth opening
-          score = THREE.MathUtils.clamp((score - 0.14) / 0.62, 0, 0.62);
+          // Filter small resting jitter (> 0.09) while allowing smooth full mouth opening
+          score = THREE.MathUtils.clamp((score - 0.09) / 0.65, 0, 0.78);
         } else if (key === 'mouthFunnel') {
-          score = THREE.MathUtils.clamp((score - 0.16) / 0.65, 0, 0.62);
+          score = THREE.MathUtils.clamp((score - 0.12) / 0.65, 0, 0.72);
         }
         blendshapes[key] = THREE.MathUtils.clamp(score, 0, 1);
       }

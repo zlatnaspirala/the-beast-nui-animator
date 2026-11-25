@@ -314,6 +314,7 @@ export class MediaPipeFaceMesh3D {
   private readonly workingPositions: Float32Array;
   private readonly vTmp = new THREE.Vector3();
   private readonly eulerTmp = new THREE.Euler(0, 0, 0, 'YXZ');
+  private smoothedOpenGate = 0;
 
   constructor() {
     this.topology = getFaceTopology();
@@ -423,88 +424,121 @@ export class MediaPipeFaceMesh3D {
       this.workingPositions[i * 3 + 2] = -(lm.z - cz) * aspectRatio * scale;
     }
 
-    // Smooth mouth tolerance & opening limiter:
-    // Closed firmly below rest threshold, opens smoothly when clearly open, capped to prevent gaping.
-    const faceH = Math.max(
-      Math.hypot(
-        this.workingPositions[10 * 3] - this.workingPositions[152 * 3],
-        this.workingPositions[10 * 3 + 1] - this.workingPositions[152 * 3 + 1],
-      ),
-      0.10,
-    );
-    const innerLipGap = Math.max(
-      0,
-      this.workingPositions[13 * 3 + 1] - this.workingPositions[14 * 3 + 1],
-    );
+    // Face-local basis (works cleanly regardless of head tilt/rotation)
+    let upX = this.workingPositions[10 * 3] - this.workingPositions[152 * 3];
+    let upY = this.workingPositions[10 * 3 + 1] - this.workingPositions[152 * 3 + 1];
+    let upZ = this.workingPositions[10 * 3 + 2] - this.workingPositions[152 * 3 + 2];
+    const faceH = Math.max(Math.hypot(upX, upY, upZ), 0.10);
+    upX /= faceH;
+    upY /= faceH;
+    upZ /= faceH;
+
+    let mrX = this.workingPositions[308 * 3] - this.workingPositions[78 * 3];
+    let mrY = this.workingPositions[308 * 3 + 1] - this.workingPositions[78 * 3 + 1];
+    let mrZ = this.workingPositions[308 * 3 + 2] - this.workingPositions[78 * 3 + 2];
+    const mouthW = Math.max(Math.hypot(mrX, mrY, mrZ), 0.02);
+    mrX /= mouthW;
+    mrY /= mouthW;
+    mrZ /= mouthW;
+
+    const mcX = (this.workingPositions[78 * 3] + this.workingPositions[308 * 3]) * 0.5;
+    const mcY = (this.workingPositions[78 * 3 + 1] + this.workingPositions[308 * 3 + 1]) * 0.5;
+    const mcZ = (this.workingPositions[78 * 3 + 2] + this.workingPositions[308 * 3 + 2]) * 0.5;
+
+    // Project inner upper (13) and lower (14) lip centers along faceUp
+    const up13 =
+      (this.workingPositions[13 * 3] - mcX) * upX +
+      (this.workingPositions[13 * 3 + 1] - mcY) * upY +
+      (this.workingPositions[13 * 3 + 2] - mcZ) * upZ;
+    const lo14 =
+      (this.workingPositions[14 * 3] - mcX) * upX +
+      (this.workingPositions[14 * 3 + 1] - mcY) * upY +
+      (this.workingPositions[14 * 3 + 2] - mcZ) * upZ;
+    const innerLipGap = Math.max(0, up13 - lo14);
     const normGap = innerLipGap / faceH;
 
-    // Smooth open gate in [0..1]
-    let openGate = 0;
+    // Responsive mouth opening: suppress tiny rest jitter (< ~0.08 jawOpen / 0.022 normGap),
+    // then ramp cleanly to 1.0 so real mouth opens follow landmarks effortlessly without fighting.
+    let targetGate = 0;
     if (rawJawOpenScore !== undefined) {
-      const scoreGate = THREE.MathUtils.smoothstep(rawJawOpenScore, 0.14, 0.24);
-      const geomGate = THREE.MathUtils.smoothstep(normGap, 0.020, 0.036);
-      openGate = scoreGate * geomGate;
+      const scoreSignal = THREE.MathUtils.smoothstep(rawJawOpenScore, 0.08, 0.19);
+      const geomSignal = THREE.MathUtils.smoothstep(normGap, 0.022, 0.044);
+      targetGate = Math.max(scoreSignal, geomSignal * 0.85);
     } else {
-      openGate = THREE.MathUtils.smoothstep(normGap, 0.026, 0.044);
+      targetGate = THREE.MathUtils.smoothstep(normGap, 0.020, 0.038);
     }
 
-    const gatedGap = innerLipGap * openGate;
-    const softStart = faceH * 0.055; // ~11mm
-    const hardCap = faceH * 0.105; // ~21mm
+    const blendSpeed = targetGate > this.smoothedOpenGate ? 0.55 : 0.35;
+    this.smoothedOpenGate += (targetGate - this.smoothedOpenGate) * blendSpeed;
+
+    const gatedGap = innerLipGap * this.smoothedOpenGate;
+    // Allow natural speech & full mouth opening freely; softly limit only extreme yawn
+    const softStart = faceH * 0.115;
+    const hardCap = faceH * 0.175;
     const targetGap =
       gatedGap <= softStart
         ? gatedGap
         : softStart +
           (hardCap - softStart) *
-            Math.tanh((gatedGap - softStart) / (faceH * 0.08));
+            Math.tanh((gatedGap - softStart) / (faceH * 0.09));
 
     if (innerLipGap > 0.0002 && targetGap < innerLipGap - 0.0001) {
       const liftFrac = THREE.MathUtils.clamp(1 - targetGap / innerLipGap, 0, 1);
+      const halfSpan = mouthW * 0.5 * 1.65;
 
-      const sampleCurveY = (chain: readonly number[]) => {
-        const pts = chain
-          .map((idx) => ({
-            x: this.workingPositions[idx * 3],
-            y: this.workingPositions[idx * 3 + 1],
-          }))
-          .sort((a, b) => a.x - b.x);
-        return (x: number): number | null => {
-          if (x <= pts[0].x || x >= pts[pts.length - 1].x) return null;
-          for (let k = 0; k < pts.length - 1; k++) {
-            const p0 = pts[k];
-            const p1 = pts[k + 1];
-            if (x >= p0.x && x <= p1.x) {
-              const span = Math.max(1e-6, p1.x - p0.x);
-              const t = (x - p0.x) / span;
-              return p0.y + (p1.y - p0.y) * t;
-            }
-          }
-          return null;
+      // Upper inner lip profile in mouth-local (uCoord, upCoord) coordinates
+      const upperCurve = INNER_UPPER_CHAIN.map((idx) => {
+        const dx = this.workingPositions[idx * 3] - mcX;
+        const dy = this.workingPositions[idx * 3 + 1] - mcY;
+        const dz = this.workingPositions[idx * 3 + 2] - mcZ;
+        return {
+          u: dx * mrX + dy * mrY + dz * mrZ,
+          v: dx * upX + dy * upY + dz * upZ,
         };
-      };
+      }).sort((a, b) => a.u - b.u);
 
-      const getUpperY = sampleCurveY(INNER_UPPER_CHAIN);
-      const getLowerY = sampleCurveY(INNER_LOWER_CHAIN);
+      const getUpperLimit = (u: number): number => {
+        if (u <= upperCurve[0].u) return upperCurve[0].v;
+        const last = upperCurve[upperCurve.length - 1];
+        if (u >= last.u) return last.v;
+        for (let k = 0; k < upperCurve.length - 1; k++) {
+          const p0 = upperCurve[k];
+          const p1 = upperCurve[k + 1];
+          if (u >= p0.u && u <= p1.u) {
+            const span = Math.max(1e-6, p1.u - p0.u);
+            return p0.v + (p1.v - p0.v) * ((u - p0.u) / span);
+          }
+        }
+        return up13;
+      };
 
       for (let i = 0; i < 468; i++) {
         if (this.topology.upperLipFullIndices.has(i)) continue;
-        const x = this.workingPositions[i * 3];
-        const y = this.workingPositions[i * 3 + 1];
-        const yUp = getUpperY(x);
-        const yLow = getLowerY(x);
-        if (yUp === null || yLow === null) continue;
-        if (y >= yUp) continue;
 
-        const localGap = Math.max(0, yUp - yLow);
-        if (localGap <= 0.0001) continue;
+        const dx = this.workingPositions[i * 3] - mcX;
+        const dy = this.workingPositions[i * 3 + 1] - mcY;
+        const dz = this.workingPositions[i * 3 + 2] - mcZ;
 
-        const depthBelow = Math.max(0, yLow - y);
-        const vertWeight = Math.exp(
-          -Math.pow(depthBelow / (faceH * 0.42), 2),
-        );
-        const lift = liftFrac * localGap * vertWeight;
-        const nextY = Math.min(y + lift, yUp - 0.0001);
-        this.workingPositions[i * 3 + 1] = nextY;
+        const uCoord = dx * mrX + dy * mrY + dz * mrZ;
+        const absNormU = Math.abs(uCoord) / halfSpan;
+        if (absNormU >= 1) continue;
+
+        const vCoord = dx * upX + dy * upY + dz * upZ;
+        const maxUpV = getUpperLimit(uCoord);
+        if (vCoord >= maxUpV) continue;
+
+        // Smooth C1 cosine taper extending past mouth corners into cheeks (prevents corner pinching)
+        const latW = 0.5 * (1 + Math.cos(Math.PI * absNormU));
+        const depthBelowLip = Math.max(0, lo14 - vCoord);
+        const vertW = Math.exp(-Math.pow(depthBelowLip / (faceH * 0.42), 2));
+        const maxSafeShift = Math.max(0, maxUpV - 0.0003 - vCoord);
+        const shift = Math.min(liftFrac * innerLipGap * latW * vertW, maxSafeShift);
+
+        if (shift > 0) {
+          this.workingPositions[i * 3] += upX * shift;
+          this.workingPositions[i * 3 + 1] += upY * shift;
+          this.workingPositions[i * 3 + 2] += upZ * shift;
+        }
       }
     }
 
