@@ -529,9 +529,7 @@ export function applyPoseFrameToRig(
   }
 
   const shapes = frame.faceBlendshapes ?? {};
-  if (rig.detailedHead) {
-    rig.detailedHead.applyBlendshapes(shapes);
-  } else if (rig.morphMeshes.length > 0) {
+  if (rig.morphMeshes.length > 0) {
     for (const mesh of rig.morphMeshes) {
       const dict = mesh.morphTargetDictionary;
       const infl = mesh.morphTargetInfluences;

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type MutableRefObject } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { BVHLoader } from 'three/addons/loaders/BVHLoader.js';
+import { MediaPipeFaceMesh3D } from '../engine/mediapipeFaceMesh3D';
 import type { ActiveMixamoRig } from '../engine/mixamoSkeleton';
 import type { MotionSourceMode } from '../types/mocap';
 
@@ -16,6 +17,7 @@ interface Viewport3DProps {
   bvhPlaybackPlaying: boolean;
   cameraPreset: CameraPreset;
   cameraTrigger: number;
+  faceMesh3DRef: MutableRefObject<MediaPipeFaceMesh3D | null>;
   onTickFrame: (nowMs: number, deltaSec: number) => void;
 }
 
@@ -27,7 +29,7 @@ const CAMERA_PRESETS: Record<
   front: { pos: [0, 1.15, 3.1], target: [0, 0.92, 0] },
   side: { pos: [3.1, 1.15, 0], target: [0, 0.92, 0] },
   top: { pos: [0, 4.1, 0.7], target: [0, 0.92, 0] },
-  'face-portrait': { pos: [0.16, 1.63, 0.62], target: [0, 1.58, 0] },
+  'face-portrait': { pos: [0.02, 1.0, 0.44], target: [0, 1.0, 0] },
 };
 
 function createContactShadowTexture(): THREE.CanvasTexture {
@@ -54,6 +56,7 @@ export function Viewport3D({
   bvhPlaybackPlaying,
   cameraPreset,
   cameraTrigger,
+  faceMesh3DRef,
   onTickFrame,
 }: Viewport3DProps) {
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -71,9 +74,14 @@ export function Viewport3D({
 
   const sceneRef = useRef<THREE.Scene | null>(null);
   const rigContainerRef = useRef<THREE.Group | null>(null);
+  const faceStageRef = useRef<THREE.Group | null>(null);
   const skeletonHelperRef = useRef<THREE.SkeletonHelper | null>(null);
   const bvhGroupRef = useRef<THREE.Group | null>(null);
   const bvhMixerRef = useRef<THREE.AnimationMixer | null>(null);
+  const shadowPlaneRef = useRef<THREE.Mesh | null>(null);
+  const gridRef = useRef<THREE.GridHelper | null>(null);
+  const floorMeshRef = useRef<THREE.Mesh | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
 
   const cameraTargetGoalRef = useRef<{
     active: boolean;
@@ -158,10 +166,11 @@ export function Viewport3D({
     controls.target.set(0, 0.92, 0);
     controls.enableDamping = !isSoftwareGl;
     controls.dampingFactor = 0.07;
-    controls.minDistance = 0.45;
+    controls.minDistance = 0.32;
     controls.maxDistance = 10.0;
     controls.maxPolarAngle = Math.PI * 0.495;
     controls.update();
+    controlsRef.current = controls;
 
     controls.addEventListener('start', () => {
       cameraTargetGoalRef.current.active = false;
@@ -201,6 +210,7 @@ export function Viewport3D({
     floorMesh.receiveShadow = true;
     floorMesh.position.y = -0.002;
     scene.add(floorMesh);
+    floorMeshRef.current = floorMesh;
 
     const grid = new THREE.GridHelper(16, 32, 0x3a4354, 0x1b202b);
     grid.position.y = 0.001;
@@ -208,6 +218,7 @@ export function Viewport3D({
     (grid.material as THREE.Material).polygonOffsetFactor = -1;
     (grid.material as THREE.Material).polygonOffsetUnits = -1;
     scene.add(grid);
+    gridRef.current = grid;
 
     const shadowTex = createContactShadowTexture();
     const shadowPlane = new THREE.Mesh(
@@ -222,12 +233,23 @@ export function Viewport3D({
     shadowPlane.rotation.x = -Math.PI / 2;
     shadowPlane.position.y = 0.004;
     scene.add(shadowPlane);
+    shadowPlaneRef.current = shadowPlane;
 
-    // Rig container & BVH verification container
+    // Rig container, dedicated Face Mesh container & BVH verification container
     const rigContainer = new THREE.Group();
     rigContainer.name = 'Active_Rig_Stage';
     scene.add(rigContainer);
     rigContainerRef.current = rigContainer;
+
+    const faceStage = new THREE.Group();
+    faceStage.name = 'MediaPipe_Face_Stage';
+    faceStage.position.set(0, 1.0, 0);
+    faceStage.visible = false;
+    const faceMesh3D = new MediaPipeFaceMesh3D();
+    faceStage.add(faceMesh3D.group);
+    scene.add(faceStage);
+    faceStageRef.current = faceStage;
+    faceMesh3DRef.current = faceMesh3D;
 
     const bvhContainer = new THREE.Group();
     bvhContainer.name = 'BVH_Verification_Stage';
@@ -361,6 +383,8 @@ export function Viewport3D({
       floorGeo.dispose();
       floorMat.dispose();
       shadowTex.dispose();
+      faceMesh3D.dispose();
+      faceMesh3DRef.current = null;
       renderer.dispose();
       if (renderer.domElement.parentElement === container) {
         container.removeChild(renderer.domElement);
@@ -391,7 +415,7 @@ export function Viewport3D({
     mat.transparent = true;
     mat.opacity = 0.85;
     helper.renderOrder = 10;
-    helper.visible = showSkeleton && mode !== 'bvh';
+    helper.visible = showSkeleton && mode !== 'bvh' && mode !== 'face';
     scene.add(helper);
     skeletonHelperRef.current = helper;
 
@@ -404,18 +428,37 @@ export function Viewport3D({
     };
   }, [rig]);
 
-  // Toggle visibility between live Mixamo rig and BVHLoader verification skeleton
+  // Keep Face Scene and Pose Scene cleanly separated
   useEffect(() => {
+    const isFace = mode === 'face';
+    const isBvh = mode === 'bvh';
+    if (faceStageRef.current) {
+      faceStageRef.current.visible = isFace;
+    }
     if (rigContainerRef.current) {
-      rigContainerRef.current.visible = mode !== 'bvh';
+      rigContainerRef.current.visible = !isFace && !isBvh;
     }
     if (bvhGroupRef.current) {
-      bvhGroupRef.current.visible = mode === 'bvh';
+      bvhGroupRef.current.visible = isBvh;
     }
     if (skeletonHelperRef.current) {
-      skeletonHelperRef.current.visible = showSkeleton && mode !== 'bvh';
+      skeletonHelperRef.current.visible = showSkeleton && !isFace && !isBvh;
     }
-  }, [mode, showSkeleton]);
+    if (shadowPlaneRef.current) {
+      shadowPlaneRef.current.visible = !isFace && !isBvh;
+    }
+    if (gridRef.current) {
+      gridRef.current.visible = !isFace;
+    }
+    if (floorMeshRef.current) {
+      floorMeshRef.current.visible = !isFace;
+    }
+    if (controlsRef.current) {
+      controlsRef.current.maxPolarAngle = isFace
+        ? Math.PI * 0.85
+        : Math.PI * 0.495;
+    }
+  }, [rig, mode, showSkeleton]);
 
   // Parse BVH ASCII text with Three.js BVHLoader when in BVH Inspector mode
   useEffect(() => {

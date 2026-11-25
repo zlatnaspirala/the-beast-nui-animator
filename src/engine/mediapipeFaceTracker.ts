@@ -146,7 +146,10 @@ export function extractFaceRigOutput(
         if (key.startsWith('eyeBlink')) {
           score = THREE.MathUtils.clamp((score - 0.12) / 0.55, 0, 1);
         } else if (key === 'jawOpen') {
-          score = THREE.MathUtils.clamp(score * 1.25, 0, 1);
+          // Deadzone against rest jitter (> 0.14) while allowing full intentional mouth opening
+          score = THREE.MathUtils.clamp((score - 0.14) / 0.62, 0, 0.62);
+        } else if (key === 'mouthFunnel') {
+          score = THREE.MathUtils.clamp((score - 0.16) / 0.65, 0, 0.62);
         }
         blendshapes[key] = THREE.MathUtils.clamp(score, 0, 1);
       }
@@ -238,16 +241,17 @@ export function generateSyntheticFaceDemo(t: number): {
       ? Math.sin(((blinkPhase - 0.92) / 0.08) * Math.PI)
       : 0;
 
-  // Speech & expression cadence
-  const talk = Math.max(0, Math.sin(t * 6.5) * 0.38 + Math.sin(t * 3.1) * 0.22);
-  const smile = Math.max(0, Math.sin(t * 0.85) * 0.75);
+  // Speech & expression cadence (mostly closed resting mouth, gentle limited opening)
+  const rawTalk = Math.sin(t * 2.6) * 0.6 + Math.sin(t * 1.3) * 0.4;
+  const talk = rawTalk > 0.55 ? ((rawTalk - 0.55) / 0.45) * 0.42 : 0;
+  const smile = Math.max(0, Math.sin(t * 0.85) * 0.72);
   const brow = Math.max(0, Math.sin(t * 1.3 - 0.5) * 0.65);
   const gaze = Math.sin(t * 1.1);
 
   return {
     headQuat,
     blendshapes: {
-      jawOpen: THREE.MathUtils.clamp(talk, 0, 0.75),
+      jawOpen: THREE.MathUtils.clamp(talk, 0, 0.42),
       mouthSmileLeft: smile,
       mouthSmileRight: smile,
       eyeBlinkLeft: blink,

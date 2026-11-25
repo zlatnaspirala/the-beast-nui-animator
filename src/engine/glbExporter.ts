@@ -4,6 +4,7 @@ import {
   FACIAL_BLENDSHAPES,
   MIXAMO_BONES,
   formatMixamoBoneName,
+  type AnimationTakeClip,
   type BoneNamingScheme,
   type MixamoBoneName,
   type PoseFrame,
@@ -21,7 +22,7 @@ export function buildMixamoAnimationClip(
   rig: ActiveMixamoRig,
   fps: number,
   namingScheme: BoneNamingScheme,
-  clipName = 'Kinesis_Mixamo_Capture',
+  clipName = 'Beast_Mixamo_Capture',
 ): THREE.AnimationClip {
   const frames = resamplePoseFrames(rawFrames, fps);
   if (frames.length === 0) {
@@ -144,8 +145,8 @@ function cloneSkeletonOnly(hipsBone: THREE.Bone): THREE.Group {
   return container;
 }
 
-export async function exportMixamoGLB(
-  rawFrames: PoseFrame[],
+export async function exportMixamoMultiGLB(
+  clips: Array<{ name: string; frames: PoseFrame[]; fps?: number }>,
   rig: ActiveMixamoRig,
   options: {
     fps: number;
@@ -155,19 +156,39 @@ export async function exportMixamoGLB(
     restoreFrame?: PoseFrame | null;
   },
 ): Promise<void> {
-  // Ensure bone names match selected scheme if using built-in mannequin
   renameMixamoRigBones(rig, options.namingScheme);
-
-  // Reset rig to clean T-Pose bind state before GLTFExporter serializes rest transforms
   resetRigToTPose(rig);
 
-  const clip = buildMixamoAnimationClip(
-    rawFrames,
-    rig,
-    options.fps,
-    options.namingScheme,
-    options.filename.replace(/\.glb$/i, ''),
-  );
+  const usedNames = new Set<string>();
+  const builtClips: THREE.AnimationClip[] = [];
+
+  clips.forEach((clipDef, idx) => {
+    if (clipDef.frames.length < 2) return;
+    let baseName = clipDef.name.trim() || `Clip_${idx + 1}`;
+    let uniqueName = baseName;
+    let suffix = 2;
+    while (usedNames.has(uniqueName)) {
+      uniqueName = `${baseName}_${suffix++}`;
+    }
+    usedNames.add(uniqueName);
+
+    builtClips.push(
+      buildMixamoAnimationClip(
+        clipDef.frames,
+        rig,
+        clipDef.fps ?? options.fps,
+        options.namingScheme,
+        uniqueName,
+      ),
+    );
+  });
+
+  if (builtClips.length === 0) {
+    if (options.restoreFrame) {
+      applyPoseFrameToRig(options.restoreFrame, rig);
+    }
+    throw new Error('No valid animation clips with at least 2 frames to export.');
+  }
 
   let exportTarget: THREE.Object3D = rig.rootObject;
   if (!options.includeMesh && rig.bones.Hips) {
@@ -177,11 +198,10 @@ export async function exportMixamoGLB(
   const exporter = new GLTFExporter();
   const glbBuffer = await exporter.parseAsync(exportTarget, {
     binary: true,
-    animations: [clip],
+    animations: builtClips,
     onlyVisible: false,
   });
 
-  // Restore viewport pose immediately after export
   if (options.restoreFrame) {
     applyPoseFrameToRig(options.restoreFrame, rig);
   }
@@ -200,3 +220,29 @@ export async function exportMixamoGLB(
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+export async function exportMixamoGLB(
+  rawFrames: PoseFrame[],
+  rig: ActiveMixamoRig,
+  options: {
+    fps: number;
+    namingScheme: BoneNamingScheme;
+    includeMesh: boolean;
+    filename: string;
+    restoreFrame?: PoseFrame | null;
+  },
+): Promise<void> {
+  return exportMixamoMultiGLB(
+    [
+      {
+        name: options.filename.replace(/\.glb$/i, ''),
+        frames: rawFrames,
+        fps: options.fps,
+      },
+    ],
+    rig,
+    options,
+  );
+}
+
+export type { AnimationTakeClip };

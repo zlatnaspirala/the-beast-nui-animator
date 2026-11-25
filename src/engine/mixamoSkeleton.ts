@@ -6,10 +6,6 @@ import {
   type BoneNamingScheme,
   type MixamoBoneName,
 } from '../types/mocap';
-import {
-  buildDetailedHeadAssembly,
-  type DetailedHeadRig,
-} from './detailedHeadMesh';
 
 export interface MixamoBoneDef {
   name: MixamoBoneName;
@@ -81,7 +77,6 @@ export interface ActiveMixamoRig {
   hipsRestHeight: number;
   isCustomModel: boolean;
   label: string;
-  detailedHead?: DetailedHeadRig;
   morphMeshes: THREE.Mesh[];
 }
 
@@ -220,16 +215,45 @@ export function buildMixamoMannequinRig(
     chestPos.clone().add(new THREE.Vector3(0, 0.02, 0.118)),
   );
 
-  // Neck & Detailed Articulated Head Assembly
+  // Neck & Classic Biomechanical Studio Mannequin Head
   addSkinnedPart(
     parts,
-    new THREE.CylinderGeometry(0.040, 0.048, 0.11, 12),
+    new THREE.CylinderGeometry(0.042, 0.048, 0.11, 12),
     boneIndexMap.Neck,
     C_JOINT,
     wp('Neck').add(new THREE.Vector3(0, 0.045, 0)),
   );
-  const detailedHead = buildDetailedHeadAssembly();
-  boneMap.Head.add(detailedHead.group);
+  const headCenter = wp('Head').add(new THREE.Vector3(0, 0.095, 0.005));
+  const headGeo = new THREE.SphereGeometry(0.094, 18, 16);
+  headGeo.scale(0.86, 1.14, 0.98);
+  addSkinnedPart(parts, headGeo, boneIndexMap.Head, C_PLATE, headCenter);
+  // Jaw / chin plate
+  addSkinnedPart(
+    parts,
+    new THREE.BoxGeometry(0.088, 0.046, 0.082),
+    boneIndexMap.Head,
+    C_SHELL,
+    headCenter.clone().add(new THREE.Vector3(0, -0.058, 0.022)),
+  );
+  // Precision amber visor strip (clear +Z forward indicator)
+  addSkinnedPart(
+    parts,
+    new THREE.BoxGeometry(0.116, 0.024, 0.026),
+    boneIndexMap.Head,
+    C_VISOR,
+    headCenter.clone().add(new THREE.Vector3(0, 0.016, 0.078)),
+  );
+  // Lateral ear sensor discs
+  for (const side of [-1, 1]) {
+    addSkinnedPart(
+      parts,
+      new THREE.CylinderGeometry(0.026, 0.026, 0.018, 14),
+      boneIndexMap.Head,
+      C_JOINT,
+      headCenter.clone().add(new THREE.Vector3(side * 0.082, 0, -0.005)),
+      new THREE.Euler(0, 0, Math.PI / 2),
+    );
+  }
 
   // Arms helper
   const buildArm = (
@@ -382,7 +406,7 @@ export function buildMixamoMannequinRig(
   });
 
   const skinnedMesh = new THREE.SkinnedMesh(mergedGeo, material);
-  skinnedMesh.name = 'Kinesis_Mixamo_Mannequin';
+  skinnedMesh.name = 'Beast_Mixamo_Mannequin';
   skinnedMesh.castShadow = true;
   skinnedMesh.receiveShadow = true;
 
@@ -414,8 +438,7 @@ export function buildMixamoMannequinRig(
     hipsRestHeight: 0.96,
     isCustomModel: false,
     label: 'Built-in Mixamo Mannequin',
-    detailedHead,
-    morphMeshes: [detailedHead.faceMesh],
+    morphMeshes: [],
   };
 }
 
@@ -584,13 +607,9 @@ export function resetRigToTPose(rig: ActiveMixamoRig): void {
       bone.quaternion.copy(rig.restLocalQuaternions[name]);
     }
   }
-  if (rig.detailedHead) {
-    rig.detailedHead.applyBlendshapes({});
-  } else {
-    for (const mesh of rig.morphMeshes) {
-      if (mesh.morphTargetInfluences) {
-        mesh.morphTargetInfluences.fill(0);
-      }
+  for (const mesh of rig.morphMeshes) {
+    if (mesh.morphTargetInfluences) {
+      mesh.morphTargetInfluences.fill(0);
     }
   }
   rig.rootObject.updateMatrixWorld(true);

@@ -36,11 +36,31 @@ export default defineConfig(() => {
             const cleanUrl = (req.url || '').split('?')[0].replace(/^\/+/, '');
             if (!cleanUrl || cleanUrl.includes('..')) return next();
             const target = path.join(wasmDir, cleanUrl);
-            if (fs.existsSync(target) && fs.statSync(target).isFile()) {
-              if (target.endsWith('.wasm')) res.setHeader('Content-Type', 'application/wasm');
-              else if (target.endsWith('.js')) res.setHeader('Content-Type', 'application/javascript');
-              fs.createReadStream(target).pipe(res);
-              return;
+            if (fs.existsSync(target)) {
+              const stat = fs.statSync(target);
+              if (stat.isFile()) {
+                const etag = `"${stat.size}-${Math.floor(stat.mtimeMs)}"`;
+                if (req.headers['if-none-match'] === etag) {
+                  res.statusCode = 304;
+                  res.end();
+                  return;
+                }
+                res.statusCode = 200;
+                if (target.endsWith('.wasm')) res.setHeader('Content-Type', 'application/wasm');
+                else if (target.endsWith('.js')) res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+                res.setHeader('Content-Length', String(stat.size));
+                res.setHeader('ETag', etag);
+                res.setHeader('Cache-Control', 'public, max-age=86400');
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                const stream = fs.createReadStream(target);
+                stream.on('error', () => {
+                  if (!res.headersSent) res.statusCode = 500;
+                  res.end();
+                });
+                req.on('close', () => stream.destroy());
+                stream.pipe(res);
+                return;
+              }
             }
             next();
           });

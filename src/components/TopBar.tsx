@@ -4,6 +4,7 @@ interface TopBarProps {
   mode: MotionSourceMode;
   onSelectMode: (mode: MotionSourceMode) => void;
   canExport: boolean;
+  exportClipCount: number;
   isExporting: boolean;
   onExportGlb: () => void;
 }
@@ -20,27 +21,28 @@ export function TopBar({
   mode,
   onSelectMode,
   canExport,
+  exportClipCount,
   isExporting,
   onExportGlb,
 }: TopBarProps) {
   return (
     <header className="h-12 sm:h-14 shrink-0 px-3 sm:px-6 bg-[#0E1117] border-b border-[#1E2430] flex items-center justify-between gap-2 sm:gap-8 z-30">
-      {/* Zone 1: Single-element Brand Wordmark */}
+      {/* Zone 1: Brand Wordmark */}
       <a
         href="#top"
         onClick={(e) => {
           e.preventDefault();
           onSelectMode('lab');
         }}
-        className="font-display text-sm sm:text-lg font-semibold tracking-tight text-[#F3F5F8] whitespace-nowrap shrink-0"
+        className="font-display text-xs sm:text-base font-semibold tracking-tight text-[#F3F5F8] whitespace-nowrap shrink-0"
       >
-        Kinesis Rig
+        The Beast animator
       </a>
 
-      {/* Zone 2: Clean single-line text navigation links */}
+      {/* Zone 2: Clean single-line text navigation links (scrollbar hidden) */}
       <nav
         aria-label="Workspace modes"
-        className="flex items-center gap-3 sm:gap-6 overflow-x-auto min-w-0"
+        className="flex items-center gap-3 sm:gap-6 overflow-x-auto scrollbar-none min-w-0"
       >
         {NAV_ITEMS.map((item) => {
           const active = mode === item.id;
@@ -65,7 +67,7 @@ export function TopBar({
         })}
       </nav>
 
-      {/* Zone 3: Single primary action */}
+      {/* Zone 3: Primary Multi-Clip GLB Export action */}
       <div className="flex items-center shrink-0">
         <button
           type="button"
@@ -77,9 +79,15 @@ export function TopBar({
               : 'bg-[#1B202B] text-[#646E80] cursor-not-allowed'
           }`}
         >
-          <span className="sm:hidden">{isExporting ? '...' : 'GLB'}</span>
+          <span className="sm:hidden">
+            {isExporting ? '...' : exportClipCount > 1 ? `GLB(${exportClipCount})` : 'GLB'}
+          </span>
           <span className="hidden sm:inline">
-            {isExporting ? 'Exporting GLB...' : 'Export GLB'}
+            {isExporting
+              ? 'Exporting GLB...'
+              : exportClipCount > 1
+                ? `Export GLB (${exportClipCount} Clips)`
+                : 'Export GLB'}
           </span>
         </button>
       </div>

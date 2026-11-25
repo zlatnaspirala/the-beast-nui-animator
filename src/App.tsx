@@ -11,7 +11,8 @@ import { TopBar } from './components/TopBar';
 import { Viewport3D, type CameraPreset } from './components/Viewport3D';
 import { downloadTextFile, generateBVHString } from './engine/bvhExporter';
 import { generateDemoLandmarks } from './engine/demoMotions';
-import { exportMixamoGLB } from './engine/glbExporter';
+import { exportMixamoGLB, exportMixamoMultiGLB } from './engine/glbExporter';
+import { MediaPipeFaceMesh3D } from './engine/mediapipeFaceMesh3D';
 import {
   MediaPipeFaceService,
   drawFace2DOverlay,
@@ -39,9 +40,11 @@ import {
   retargetLandmarksToPoseFrame,
 } from './engine/poseRetargeter';
 import type {
+  AnimationTakeClip,
   DemoMotionId,
   MotionSourceMode,
   PoseFrame,
+  RecordOptions,
   RetargetSettings,
 } from './types/mocap';
 
@@ -54,6 +57,12 @@ const DEFAULT_SETTINGS: RetargetSettings = {
   namingScheme: 'mixamo-colon',
   includeMeshInGlb: true,
   showSkeleton: true,
+};
+
+const DEFAULT_RECORD_OPTIONS: RecordOptions = {
+  startDelaySec: 0,
+  durationLimitSec: 0,
+  frameSkip: 1,
 };
 
 function createInitialSampleTake(rig: ActiveMixamoRig): PoseFrame[] {
@@ -96,9 +105,15 @@ export default function App() {
   const [fpsEstimate, setFpsEstimate] = useState(30);
 
   const [isRecording, setIsRecording] = useState(false);
+  const [countdownSec, setCountdownSec] = useState(0);
+  const [recordElapsedSec, setRecordElapsedSec] = useState(0);
+  const [recordOptions, setRecordOptions] = useState<RecordOptions>(
+    DEFAULT_RECORD_OPTIONS,
+  );
   const [recordedFrames, setRecordedFrames] = useState<PoseFrame[]>(() =>
     createInitialSampleTake(defaultRig),
   );
+  const [savedClips, setSavedClips] = useState<AnimationTakeClip[]>([]);
   const [isPlayingTake, setIsPlayingTake] = useState(false);
   const [playbackFrameIdx, setPlaybackFrameIdx] = useState(0);
   const [bvhPlaying, setBvhPlaying] = useState(true);
@@ -117,7 +132,11 @@ export default function App() {
 
   const poseServiceRef = useRef<MediaPipePoseService | null>(null);
   const faceServiceRef = useRef<MediaPipeFaceService | null>(null);
+  const faceMesh3DRef = useRef<MediaPipeFaceMesh3D | null>(null);
   const filterRef = useRef<PoseLandmarkFilter>(new PoseLandmarkFilter(33));
+  const faceLandmarkFilterRef = useRef<PoseLandmarkFilter>(
+    new PoseLandmarkFilter(478),
+  );
   const faceFilterRef = useRef<FaceBlendshapeFilter>(new FaceBlendshapeFilter());
   const faceHeadQuatRef = useRef<THREE.Quaternion>(new THREE.Quaternion());
   const faceHeadQuatInitializedRef = useRef(false);
@@ -131,6 +150,8 @@ export default function App() {
   demoMotionRef.current = demoMotion;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const recordOptionsRef = useRef(recordOptions);
+  recordOptionsRef.current = recordOptions;
   const cameraActiveRef = useRef(cameraActive);
   cameraActiveRef.current = cameraActive;
   const videoLoadedRef = useRef(videoLoaded);
@@ -144,6 +165,9 @@ export default function App() {
   const lastAppliedFrameRef = useRef<PoseFrame | null>(null);
   const labTimeRef = useRef(0);
   const recordStartMsRef = useRef(0);
+  const rawFrameTickCounterRef = useRef(0);
+  const countdownTimerRef = useRef<number | null>(null);
+  const clipCounterRef = useRef(1);
   const playbackTimeRef = useRef(0);
   const lastVideoTimeRef = useRef(-1);
   const lastHudSyncMsRef = useRef(0);
@@ -174,9 +198,13 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  // Cleanup camera & MediaPipe on unmount
+  // Cleanup camera, countdown timer & MediaPipe on unmount
   useEffect(() => {
     return () => {
+      if (countdownTimerRef.current !== null) {
+        window.clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
@@ -330,6 +358,7 @@ export default function App() {
       }
 
       filterRef.current.reset();
+      faceLandmarkFilterRef.current.reset();
       faceFilterRef.current.reset();
       faceHeadQuatInitializedRef.current = false;
       lastVideoTimeRef.current = -1;
@@ -422,6 +451,7 @@ export default function App() {
       if (nextMode === 'face') {
         setCameraPreset('face-portrait');
         setCameraTrigger((n) => n + 1);
+        faceLandmarkFilterRef.current.reset();
         faceFilterRef.current.reset();
         faceHeadQuatInitializedRef.current = false;
         if (cameraActive) {
@@ -472,24 +502,98 @@ export default function App() {
     ],
   );
 
-  const handleToggleRecord = useCallback(() => {
-    if (isRecording) {
+  const clearCountdownTimer = useCallback(() => {
+    if (countdownTimerRef.current !== null) {
+      window.clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    setCountdownSec(0);
+  }, []);
+
+  const beginRecordingImmediate = useCallback(() => {
+    clearCountdownTimer();
+    recordedFramesRef.current = [];
+    rawFrameTickCounterRef.current = 0;
+    setRecordedFrames([]);
+    setPlaybackFrameIdx(0);
+    setIsPlayingTake(false);
+    setRecordElapsedSec(0);
+    recordStartMsRef.current = performance.now();
+    isRecordingRef.current = true;
+    setIsRecording(true);
+  }, [clearCountdownTimer]);
+
+  const stopRecordingAndFinalize = useCallback(
+    (autoStopped = false) => {
+      isRecordingRef.current = false;
       setIsRecording(false);
-      setRecordedFrames([...recordedFramesRef.current]);
-      if (recordedFramesRef.current.length > 1) {
+      setRecordElapsedSec(0);
+      const frames = [...recordedFramesRef.current];
+      setRecordedFrames(frames);
+      if (frames.length > 1) {
         showNotice(
-          `Captured ${recordedFramesRef.current.length} frames ready for BVH & GLB export.`,
+          autoStopped
+            ? `Interval complete: captured ${frames.length} frames.`
+            : `Captured ${frames.length} frames ready for BVH & GLB export.`,
         );
       }
-    } else {
-      recordedFramesRef.current = [];
-      setRecordedFrames([]);
-      setPlaybackFrameIdx(0);
-      setIsPlayingTake(false);
-      recordStartMsRef.current = performance.now();
-      setIsRecording(true);
+    },
+    [showNotice],
+  );
+
+  const pushRecordedFrame = useCallback(
+    (frame: PoseFrame) => {
+      const opts = recordOptionsRef.current;
+      const tickIdx = rawFrameTickCounterRef.current++;
+      const step = Math.max(1, opts.frameSkip);
+      const isAtLimit =
+        opts.durationLimitSec > 0 && frame.time >= opts.durationLimitSec;
+      if (tickIdx === 0 || tickIdx % step === 0 || isAtLimit) {
+        recordedFramesRef.current.push(frame);
+      }
+      if (isAtLimit) {
+        stopRecordingAndFinalize(true);
+      }
+    },
+    [stopRecordingAndFinalize],
+  );
+
+  const handleToggleRecord = useCallback(() => {
+    if (countdownSec > 0) {
+      clearCountdownTimer();
+      showNotice('Recording countdown cancelled.');
+      return;
     }
-  }, [isRecording, showNotice]);
+    if (isRecording) {
+      stopRecordingAndFinalize(false);
+      return;
+    }
+
+    const delay = recordOptions.startDelaySec;
+    if (delay > 0) {
+      clearCountdownTimer();
+      const endMs = performance.now() + delay * 1000;
+      setCountdownSec(delay);
+      countdownTimerRef.current = window.setInterval(() => {
+        const rem = (endMs - performance.now()) / 1000;
+        if (rem <= 0) {
+          beginRecordingImmediate();
+        } else {
+          setCountdownSec(rem);
+        }
+      }, 100);
+    } else {
+      beginRecordingImmediate();
+    }
+  }, [
+    beginRecordingImmediate,
+    clearCountdownTimer,
+    countdownSec,
+    isRecording,
+    recordOptions.startDelaySec,
+    showNotice,
+    stopRecordingAndFinalize,
+  ]);
 
   const handleTogglePlayTake = useCallback(() => {
     if (recordedFramesRef.current.length < 2) return;
@@ -530,11 +634,90 @@ export default function App() {
   }, [playbackFrameIdx, showNotice]);
 
   const handleClearTake = useCallback(() => {
+    clearCountdownTimer();
+    isRecordingRef.current = false;
     setIsRecording(false);
+    setRecordElapsedSec(0);
     setIsPlayingTake(false);
     recordedFramesRef.current = [];
+    rawFrameTickCounterRef.current = 0;
     setRecordedFrames([]);
     setPlaybackFrameIdx(0);
+  }, [clearCountdownTimer]);
+
+  const handleSaveCurrentClip = useCallback(() => {
+    const frames = recordedFramesRef.current;
+    if (frames.length < 2) {
+      showNotice('Record at least 2 frames before adding a clip.');
+      return;
+    }
+    const base =
+      mode === 'lab'
+        ? demoMotion
+        : mode === 'face'
+          ? 'face_rig'
+          : mode === 'video'
+            ? 'video_track'
+            : 'live_capture';
+    const num = String(clipCounterRef.current++).padStart(2, '0');
+    const name = `${base}_${num}`;
+    const clonedFrames: PoseFrame[] = frames.map((f) => ({
+      time: f.time,
+      hipsPosition: [...f.hipsPosition] as [number, number, number],
+      rotations: { ...f.rotations },
+      faceBlendshapes: f.faceBlendshapes ? { ...f.faceBlendshapes } : undefined,
+    }));
+
+    const newClip: AnimationTakeClip = {
+      id: `clip_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      name,
+      frames: clonedFrames,
+      fps: settings.fps,
+      included: true,
+    };
+    setSavedClips((prev) => [...prev, newClip]);
+    showNotice(`Added "${name}" to GLB Clips.`);
+  }, [demoMotion, mode, settings.fps, showNotice]);
+
+  const handleToggleClipIncluded = useCallback((id: string) => {
+    setSavedClips((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, included: !c.included } : c)),
+    );
+  }, []);
+
+  const handleRenameClip = useCallback((id: string, name: string) => {
+    setSavedClips((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, name } : c)),
+    );
+  }, []);
+
+  const handleLoadClip = useCallback(
+    (id: string) => {
+      const clip = savedClips.find((c) => c.id === id);
+      if (!clip || clip.frames.length < 2) return;
+      clearCountdownTimer();
+      isRecordingRef.current = false;
+      setIsRecording(false);
+      const cloned: PoseFrame[] = clip.frames.map((f) => ({
+        time: f.time,
+        hipsPosition: [...f.hipsPosition] as [number, number, number],
+        rotations: { ...f.rotations },
+        faceBlendshapes: f.faceBlendshapes ? { ...f.faceBlendshapes } : undefined,
+      }));
+      recordedFramesRef.current = cloned;
+      setRecordedFrames(cloned);
+      playbackTimeRef.current = 0;
+      setPlaybackFrameIdx(0);
+      applyPoseFrameToRig(cloned[0], rigRef.current);
+      lastAppliedFrameRef.current = cloned[0];
+      setIsPlayingTake(true);
+      showNotice(`Loaded "${clip.name}" into timeline.`);
+    },
+    [clearCountdownTimer, savedClips, showNotice],
+  );
+
+  const handleDeleteClip = useCallback((id: string) => {
+    setSavedClips((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
   const handleUploadMixamoGlb = useCallback(
@@ -575,38 +758,67 @@ export default function App() {
     );
   }, [recordedFrames, settings.fps, settings.namingScheme]);
 
+  const includedClips = useMemo(
+    () => savedClips.filter((c) => c.included && c.frames.length > 1),
+    [savedClips],
+  );
+
   const handleExportBvh = useCallback(() => {
     if (!bvhText) {
       showNotice('Record a motion clip first to export BVH.');
       return;
     }
     const stamp = new Date().toISOString().slice(11, 19).replace(/:/g, '-');
-    downloadTextFile(bvhText, `kinesis_mixamo_${stamp}.bvh`);
+    downloadTextFile(bvhText, `beast_animator_${stamp}.bvh`);
     showNotice('Exported Mixamo-compatible .BVH animation.');
   }, [bvhText, showNotice]);
 
   const handleExportGlb = useCallback(async () => {
-    if (recordedFrames.length < 2) {
-      showNotice('Record a motion clip first to export GLB.');
+    const hasMultiClips = includedClips.length > 0;
+    if (!hasMultiClips && recordedFrames.length < 2) {
+      showNotice('Record or add a motion clip first to export GLB.');
       return;
     }
     setIsExporting(true);
     try {
       const stamp = new Date().toISOString().slice(11, 19).replace(/:/g, '-');
-      await exportMixamoGLB(recordedFrames, rigRef.current, {
-        fps: settings.fps,
-        namingScheme: settings.namingScheme,
-        includeMesh: settings.includeMeshInGlb,
-        filename: `kinesis_mixamo_${stamp}.glb`,
-        restoreFrame: lastAppliedFrameRef.current,
-      });
-      showNotice('Exported rigged Mixamo .GLB animation.');
+      const filename = `beast_animator_${stamp}.glb`;
+      if (hasMultiClips) {
+        await exportMixamoMultiGLB(
+          includedClips.map((c) => ({
+            name: c.name,
+            frames: c.frames,
+            fps: c.fps,
+          })),
+          rigRef.current,
+          {
+            fps: settings.fps,
+            namingScheme: settings.namingScheme,
+            includeMesh: settings.includeMeshInGlb,
+            filename,
+            restoreFrame: lastAppliedFrameRef.current,
+          },
+        );
+        showNotice(
+          `Exported multi-animation .GLB (${includedClips.length} clip${includedClips.length > 1 ? 's' : ''}).`,
+        );
+      } else {
+        await exportMixamoGLB(recordedFrames, rigRef.current, {
+          fps: settings.fps,
+          namingScheme: settings.namingScheme,
+          includeMesh: settings.includeMeshInGlb,
+          filename,
+          restoreFrame: lastAppliedFrameRef.current,
+        });
+        showNotice('Exported rigged Mixamo .GLB animation.');
+      }
     } catch {
       showNotice('GLB export failed. Check console for details.');
     } finally {
       setIsExporting(false);
     }
   }, [
+    includedClips,
     recordedFrames,
     settings.fps,
     settings.includeMeshInGlb,
@@ -684,12 +896,12 @@ export default function App() {
           applyPoseFrameToRig(frame, curRig);
           lastAppliedFrameRef.current = frame;
           if (isRecordingRef.current) {
-            recordedFramesRef.current.push(frame);
+            pushRecordedFrame(frame);
           }
         }
       }
 
-      // 3. Face-Only Rig via MediaPipe FaceLandmarker (or demo expressions when cam off)
+      // 3. Dedicated MediaPipe 478-pt Face Mesh Scene (isolated from Pose Scene)
       if (curMode === 'face') {
         if (cameraActiveRef.current) {
           const video = videoRef.current;
@@ -724,81 +936,89 @@ export default function App() {
               }
             }
 
-            if (res) {
-              const extracted = extractFaceRigOutput(
-                res,
-                curSettings.mirrorCamera,
+            if (res?.faceLandmarks?.[0]) {
+              const filteredLms = faceLandmarkFilterRef.current.filter(
+                res.faceLandmarks[0],
+                nowMs / 1000,
+                curSettings.smoothing,
               );
-              if (extracted) {
-                const filteredShapes = faceFilterRef.current.filter(
-                  extracted.blendshapes,
-                  nowMs / 1000,
-                  curSettings.smoothing,
-                );
-                if (
-                  !faceHeadQuatInitializedRef.current ||
-                  curSettings.smoothing <= 0.01
-                ) {
-                  faceHeadQuatRef.current.copy(extracted.headQuat);
-                  faceHeadQuatInitializedRef.current = true;
-                } else {
-                  const slerpRate = 28 - curSettings.smoothing * 22;
-                  const alpha = 1 - Math.exp(-deltaSec * slerpRate);
-                  faceHeadQuatRef.current.slerp(extracted.headQuat, alpha);
-                }
+              const rawJawOpenScore = res.faceBlendshapes?.[0]?.categories?.find(
+                (c) => c.categoryName === 'jawOpen',
+              )?.score;
+              faceMesh3DRef.current?.updateFromLandmarks(
+                filteredLms,
+                video.videoWidth / video.videoHeight,
+                curSettings.mirrorCamera,
+                rawJawOpenScore,
+              );
 
-                const frame = retargetFaceToPoseFrame(
-                  faceHeadQuatRef.current,
-                  filteredShapes,
-                  curRig,
-                  isRecordingRef.current
-                    ? (nowMs - recordStartMsRef.current) / 1000
-                    : 0,
+              if (isRecordingRef.current) {
+                const extracted = extractFaceRigOutput(
+                  res,
+                  curSettings.mirrorCamera,
                 );
-                applyPoseFrameToRig(frame, curRig);
-                lastAppliedFrameRef.current = frame;
-                if (isRecordingRef.current) {
-                  recordedFramesRef.current.push(frame);
-                }
-
-                fpsCounterRef.current.frames++;
-                if (nowMs - fpsCounterRef.current.lastMs > 500) {
-                  const elapsed =
-                    (nowMs - fpsCounterRef.current.lastMs) / 1000;
-                  setFpsEstimate(
-                    Math.round(fpsCounterRef.current.frames / elapsed),
+                if (extracted) {
+                  const filteredShapes = faceFilterRef.current.filter(
+                    extracted.blendshapes,
+                    nowMs / 1000,
+                    curSettings.smoothing,
                   );
-                  fpsCounterRef.current.frames = 0;
-                  fpsCounterRef.current.lastMs = nowMs;
-                  setLandmarkConfidence(0.99);
+                  if (
+                    !faceHeadQuatInitializedRef.current ||
+                    curSettings.smoothing <= 0.01
+                  ) {
+                    faceHeadQuatRef.current.copy(extracted.headQuat);
+                    faceHeadQuatInitializedRef.current = true;
+                  } else {
+                    const slerpRate = 28 - curSettings.smoothing * 22;
+                    const alpha = 1 - Math.exp(-deltaSec * slerpRate);
+                    faceHeadQuatRef.current.slerp(extracted.headQuat, alpha);
+                  }
+                  const frame = retargetFaceToPoseFrame(
+                    faceHeadQuatRef.current,
+                    filteredShapes,
+                    curRig,
+                    (nowMs - recordStartMsRef.current) / 1000,
+                  );
+                  pushRecordedFrame(frame);
                 }
+              }
+
+              fpsCounterRef.current.frames++;
+              if (nowMs - fpsCounterRef.current.lastMs > 500) {
+                const elapsed =
+                  (nowMs - fpsCounterRef.current.lastMs) / 1000;
+                setFpsEstimate(
+                  Math.round(fpsCounterRef.current.frames / elapsed),
+                );
+                fpsCounterRef.current.frames = 0;
+                fpsCounterRef.current.lastMs = nowMs;
+                setLandmarkConfidence(0.99);
               }
             }
           }
         } else {
-          // Synthetic facial expression demo when Face Cam is off
+          // Synthetic 478-pt MediaPipe Face Mesh demo when Face Cam is off
           labTimeRef.current += deltaSec;
           if (ctx && canvas) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
           }
-          const demo = generateSyntheticFaceDemo(labTimeRef.current);
-          const filteredShapes = faceFilterRef.current.filter(
-            demo.blendshapes,
-            nowMs / 1000,
-            curSettings.smoothing,
-          );
-          const frame = retargetFaceToPoseFrame(
-            demo.headQuat,
-            filteredShapes,
-            curRig,
-            isRecordingRef.current
-              ? (nowMs - recordStartMsRef.current) / 1000
-              : 0,
-          );
-          applyPoseFrameToRig(frame, curRig);
-          lastAppliedFrameRef.current = frame;
+          faceMesh3DRef.current?.updateSyntheticDemo(labTimeRef.current);
+
           if (isRecordingRef.current) {
-            recordedFramesRef.current.push(frame);
+            const demo = generateSyntheticFaceDemo(labTimeRef.current);
+            const filteredShapes = faceFilterRef.current.filter(
+              demo.blendshapes,
+              nowMs / 1000,
+              curSettings.smoothing,
+            );
+            const frame = retargetFaceToPoseFrame(
+              demo.headQuat,
+              filteredShapes,
+              curRig,
+              (nowMs - recordStartMsRef.current) / 1000,
+            );
+            pushRecordedFrame(frame);
           }
         }
       }
@@ -867,7 +1087,7 @@ export default function App() {
                 applyPoseFrameToRig(frame, curRig);
                 lastAppliedFrameRef.current = frame;
                 if (isRecordingRef.current) {
-                  recordedFramesRef.current.push(frame);
+                  pushRecordedFrame(frame);
                 }
               }
 
@@ -899,10 +1119,11 @@ export default function App() {
         nowMs - lastHudSyncMsRef.current > 100
       ) {
         lastHudSyncMsRef.current = nowMs;
+        setRecordElapsedSec((nowMs - recordStartMsRef.current) / 1000);
         setRecordedFrames([...recordedFramesRef.current]);
       }
     },
-    [],
+    [pushRecordedFrame],
   );
 
   const recordedDuration =
@@ -910,12 +1131,20 @@ export default function App() {
       ? recordedFrames[recordedFrames.length - 1].time
       : 0;
 
+  const exportClipCount =
+    includedClips.length > 0
+      ? includedClips.length
+      : recordedFrames.length > 1
+        ? 1
+        : 0;
+
   return (
     <div className="h-[100dvh] w-screen flex flex-col bg-[#0B0D11] text-[#F3F5F8] overflow-hidden select-none">
       <TopBar
         mode={mode}
         onSelectMode={handleSelectMode}
-        canExport={recordedFrames.length > 1}
+        canExport={exportClipCount > 0}
+        exportClipCount={exportClipCount}
         isExporting={isExporting}
         onExportGlb={handleExportGlb}
       />
@@ -929,6 +1158,7 @@ export default function App() {
           bvhPlaybackPlaying={bvhPlaying}
           cameraPreset={cameraPreset}
           cameraTrigger={cameraTrigger}
+          faceMesh3DRef={faceMesh3DRef}
           onTickFrame={onTickFrame}
         />
 
@@ -978,6 +1208,18 @@ export default function App() {
           </div>
         )}
 
+        {countdownSec > 0 && (
+          <div
+            role="status"
+            className="absolute top-14 left-1/2 -translate-x-1/2 z-30 px-5 py-2.5 rounded-xl bg-[#141821] border border-amber-500/60 text-sm font-semibold text-amber-400 shadow-2xl pointer-events-none flex items-center gap-2"
+          >
+            <span>Recording starts in</span>
+            <span className="font-mono text-base tabular-nums text-[#F3F5F8]">
+              {Math.ceil(countdownSec)}s
+            </span>
+          </div>
+        )}
+
         <BottomDock
           mode={mode}
           demoMotion={demoMotion}
@@ -992,6 +1234,12 @@ export default function App() {
           onUploadVideo={handleUploadVideo}
           onToggleVideoPlay={handleToggleVideoPlay}
           isRecording={isRecording}
+          countdownSec={countdownSec}
+          recordElapsedSec={recordElapsedSec}
+          recordOptions={recordOptions}
+          onUpdateRecordOptions={(patch) =>
+            setRecordOptions((prev) => ({ ...prev, ...patch }))
+          }
           onToggleRecord={handleToggleRecord}
           recordedCount={recordedFrames.length}
           recordedDuration={recordedDuration}
@@ -1001,6 +1249,12 @@ export default function App() {
           onScrubTake={handleScrubTake}
           onSmoothTake={handleSmoothTake}
           onClearTake={handleClearTake}
+          savedClips={savedClips}
+          onSaveCurrentClip={handleSaveCurrentClip}
+          onToggleClipIncluded={handleToggleClipIncluded}
+          onRenameClip={handleRenameClip}
+          onLoadClip={handleLoadClip}
+          onDeleteClip={handleDeleteClip}
           bvhPlaying={bvhPlaying}
           onToggleBvhPlay={() => setBvhPlaying((p) => !p)}
           settings={settings}

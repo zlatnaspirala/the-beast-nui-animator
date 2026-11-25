@@ -88,6 +88,20 @@ export interface RetargetSettings {
   showSkeleton: boolean;
 }
 
+export interface RecordOptions {
+  startDelaySec: number; // 0 = immediate, 3/5/10s countdown before recording starts
+  durationLimitSec: number; // 0 = manual stop, >0 = auto-stop after X seconds
+  frameSkip: number; // 1 = keep every frame, 2 = keep every 2nd frame, etc.
+}
+
+export interface AnimationTakeClip {
+  id: string;
+  name: string;
+  frames: PoseFrame[];
+  fps: 24 | 30 | 60;
+  included: boolean;
+}
+
 export function formatMixamoBoneName(
   bone: MixamoBoneName,
   scheme: BoneNamingScheme,
